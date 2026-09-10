@@ -41,8 +41,11 @@ async function initDb() {
       vcf_formatted_name TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )`);
+    const proofsHasId = await pool.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'proofs' AND column_name = 'id'`);
+    if (!proofsHasId.rows.length) await pool.query('DROP TABLE IF EXISTS proofs');
     await pool.query(`CREATE TABLE IF NOT EXISTS proofs (
-      submission_id INTEGER PRIMARY KEY REFERENCES submissions(id) ON DELETE CASCADE,
+      id SERIAL PRIMARY KEY,
+      submission_id INTEGER NOT NULL REFERENCES submissions(id) ON DELETE CASCADE,
       mime TEXT NOT NULL,
       data BYTEA NOT NULL
     )`);
@@ -69,7 +72,8 @@ async function getSettings() {
 }
 
 function mapUser(row) {
-  return { id: row.id, uniqueCode: row.unique_code, fullName: row.full_name, school: row.school, phoneNumber: row.phone_number, submissionType: row.submission_type, proofImageUrl: `/proof/${row.unique_code}`, status: row.status, rejectionReason: row.rejection_reason, vcfFormattedName: row.vcf_formatted_name, createdAt: row.created_at };
+  const labels = { TASK: 'Task (free)', PAYMENT: 'Verification ₦500', BUY_VCF: 'Buy VCF ₦1,500' };
+  return { id: row.id, uniqueCode: row.unique_code, fullName: row.full_name, school: row.school, phoneNumber: row.phone_number, submissionType: row.submission_type, submissionTypeLabel: labels[row.submission_type] || row.submission_type, proofImageUrl: `/proof/${row.unique_code}`, proofCount: row.proof_count !== undefined ? row.proof_count : 0, status: row.status, rejectionReason: row.rejection_reason, vcfFormattedName: row.vcf_formatted_name, createdAt: row.created_at };
 }
 
 function code() { return `ALC-${crypto.randomInt(10000, 99999)}`; }
@@ -77,7 +81,7 @@ function escapeVcf(value) { return String(value).replace(/[\\;,]/g, '\\$&').repl
 function labelFor(user) { return user.school === 'Not in School' ? `ALC: ${user.fullName}` : `ALC: ${user.fullName} ${user.school}`; }
 function notifyTelegram(user) {
   if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) return;
-  const text = `🔔 NEW CONTACT GAIN SUBMISSION\n\nTracking Code: ${user.uniqueCode}\nName: ${user.fullName}\nSchool: ${user.school}\nType: ${user.submissionType}\nPhone: ${user.phoneNumber}\n\n👉 Verify: ${process.env.PUBLIC_URL || ''}/admin/verify/${user.uniqueCode}`;
+  const text = `🔔 NEW CONTACT GAIN SUBMISSION\n\nTracking Code: ${user.uniqueCode}\nName: ${user.fullName}\nSchool: ${user.school}\nType: ${user.submissionTypeLabel || user.submissionType}\nPhone: ${user.phoneNumber}\n\n👉 Verify: ${process.env.PUBLIC_URL || ''}/admin/verify/${user.uniqueCode}`;
   fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text }) }).catch(() => {});
 }
 function admin(req, res, next) {
@@ -88,9 +92,14 @@ function admin(req, res, next) {
 
 app.get('/', wrap(async (req, res) => res.render('home', { settings: await getSettings() })));
 
-app.post('/submit', upload.single('proof'), wrap(async (req, res) => {
+app.get('/buy-vcf', wrap(async (req, res) => res.render('buy-vcf', { settings: await getSettings() })));
+
+app.post('/submit', upload.fields([{ name: 'proofs', maxCount: 10 }, { name: 'proof', maxCount: 1 }]), wrap(async (req, res) => {
   const { fullName, school, phoneNumber, submissionType, channelFollowed } = req.body;
-  if (!channelFollowed || !fullName || !school || !phoneNumber || !['VERIFICATION', 'BUY_VCF'].includes(submissionType) || !req.file) return res.status(400).render('message', { title: 'Submission incomplete', message: 'Please follow the channel and complete every field with a valid image proof.', link: '/' });
+  const taskFiles = (req.files && req.files.proofs) || [];
+  const receiptFile = (req.files && req.files.proof) || [];
+  const images = submissionType === 'TASK' ? taskFiles : receiptFile;
+  if (!channelFollowed || !fullName || !school || !phoneNumber || !['TASK', 'PAYMENT', 'BUY_VCF'].includes(submissionType) || !images.length) return res.status(400).render('message', { title: 'Submission incomplete', message: 'Please follow the channel and complete every field with a valid image proof.', link: '/' });
   let uniqueCode = code();
   for (;;) {
     const { rows } = await pool.query('SELECT 1 FROM submissions WHERE unique_code = $1', [uniqueCode]);
@@ -106,7 +115,9 @@ app.post('/submit', upload.single('proof'), wrap(async (req, res) => {
       [uniqueCode, fullName.trim(), school, phoneNumber.trim(), submissionType]
     );
     row = inserted.rows[0];
-    await client.query('INSERT INTO proofs (submission_id, mime, data) VALUES ($1, $2, $3)', [row.id, req.file.mimetype, req.file.buffer]);
+    for (const img of images) {
+      await client.query('INSERT INTO proofs (submission_id, mime, data) VALUES ($1, $2, $3)', [row.id, img.mimetype, img.buffer]);
+    }
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -123,20 +134,21 @@ app.get('/check-status', (req, res) => res.render('status', { result: null, quer
 
 app.post('/api/search', wrap(async (req, res) => {
   const query = String(req.body.query || '').trim().toLowerCase();
-  const { rows } = await pool.query('SELECT * FROM submissions WHERE LOWER(unique_code) = $1 OR LOWER(phone_number) = $1', [query]);
+  const { rows } = await pool.query('SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s WHERE LOWER(s.unique_code) = $1 OR LOWER(s.phone_number) = $1', [query]);
   if (!rows.length) return res.status(404).json({ error: 'No submission found for that code or phone number.' });
   res.json({ user: mapUser(rows[0]) });
 }));
 
 app.get('/proof/:code', admin, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT p.mime, p.data FROM proofs p JOIN submissions s ON s.id = p.submission_id WHERE s.unique_code = $1', [req.params.code]);
+  const index = Math.max(0, parseInt(req.query.i, 10) || 0);
+  const { rows } = await pool.query('SELECT p.mime, p.data FROM proofs p JOIN submissions s ON s.id = p.submission_id WHERE s.unique_code = $1 ORDER BY p.id OFFSET $2 LIMIT 1', [req.params.code, index]);
   if (!rows.length) return res.status(404).send('Not found');
   res.set('Content-Type', rows[0].mime);
   res.send(rows[0].data);
 }));
 
 app.get('/admin', admin, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM submissions ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s ORDER BY created_at DESC');
   res.render('admin', { users: rows.map(mapUser), key: req.query.key });
 }));
 
@@ -155,7 +167,7 @@ app.post('/admin/settings', admin, wrap(async (req, res) => {
 }));
 
 app.get('/admin/verify/:code', admin, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM submissions WHERE unique_code = $1', [req.params.code]);
+  const { rows } = await pool.query('SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s WHERE s.unique_code = $1', [req.params.code]);
   if (!rows.length) return res.status(404).render('message', { title: 'Submission not found', message: 'That tracking code does not exist.', link: '/admin?key=' + encodeURIComponent(req.query.key) });
   res.render('verify', { user: mapUser(rows[0]), key: req.query.key });
 }));
