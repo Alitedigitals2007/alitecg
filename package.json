@@ -1,0 +1,18 @@
+{
+  "name": "alotedigitals-contact-gain",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WhatsApp contact verification and VCF generation platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ejs": "^3.1.10",
+    "express": "^4.21.1",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.23.0"
+  }
+}
