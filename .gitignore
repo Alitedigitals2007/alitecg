@@ -3,3 +3,5 @@ public/uploads/*
 data/submissions.json
 data/approved-contacts.vcf
 !data/.gitkeep
+
+session-*.md
