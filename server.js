@@ -99,7 +99,7 @@ app.post('/submit', upload.fields([{ name: 'proofs', maxCount: 10 }, { name: 'pr
   const taskFiles = (req.files && req.files.proofs) || [];
   const receiptFile = (req.files && req.files.proof) || [];
   const images = submissionType === 'TASK' ? taskFiles : receiptFile;
-  if (!channelFollowed || !fullName || !school || !phoneNumber || !['TASK', 'PAYMENT', 'BUY_VCF'].includes(submissionType) || !images.length) return res.status(400).render('message', { title: 'Submission incomplete', message: 'Please follow the channel and complete every field with a valid image proof.', link: '/' });
+  if (!channelFollowed || !fullName || !school || !phoneNumber || !['TASK', 'PAYMENT'].includes(submissionType) || !images.length) return res.status(400).render('message', { title: 'Submission incomplete', message: 'Please follow the channel and complete every field with a valid image proof.', link: '/' });
   let uniqueCode = code();
   for (;;) {
     const { rows } = await pool.query('SELECT 1 FROM submissions WHERE unique_code = $1', [uniqueCode]);
@@ -132,6 +132,36 @@ app.post('/submit', upload.fields([{ name: 'proofs', maxCount: 10 }, { name: 'pr
 
 app.get('/check-status', (req, res) => res.render('status', { result: null, query: '' }));
 
+app.post('/submit-vcf', upload.single('proof'), wrap(async (req, res) => {
+  const { fullName, phoneNumber, channelFollowed } = req.body;
+  if (!channelFollowed || !fullName || !phoneNumber || !req.file) return res.status(400).render('message', { title: 'Order incomplete', message: 'Please complete your name, WhatsApp number and upload your payment receipt.', link: '/buy-vcf' });
+  let uniqueCode = code();
+  for (;;) {
+    const { rows } = await pool.query('SELECT 1 FROM submissions WHERE unique_code = $1', [uniqueCode]);
+    if (!rows.length) break;
+    uniqueCode = code();
+  }
+  const client = await pool.connect();
+  let row;
+  try {
+    await client.query('BEGIN');
+    const inserted = await client.query(
+      'INSERT INTO submissions (unique_code, full_name, school, phone_number, submission_type) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [uniqueCode, fullName.trim(), 'N/A', phoneNumber.trim(), 'BUY_VCF']
+    );
+    row = inserted.rows[0];
+    await client.query('INSERT INTO proofs (submission_id, mime, data) VALUES ($1, $2, $3)', [row.id, req.file.mimetype, req.file.buffer]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    client.release();
+    throw err;
+  }
+  client.release();
+  notifyTelegram(mapUser(row));
+  res.render('vcf-submitted', { user: mapUser(row), settings: await getSettings() });
+}));
+
 app.post('/api/search', wrap(async (req, res) => {
   const query = String(req.body.query || '').trim().toLowerCase();
   const { rows } = await pool.query('SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s WHERE LOWER(s.unique_code) = $1 OR LOWER(s.phone_number) = $1', [query]);
@@ -148,8 +178,13 @@ app.get('/proof/:code', admin, wrap(async (req, res) => {
 }));
 
 app.get('/admin', admin, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s ORDER BY created_at DESC');
+  const { rows } = await pool.query("SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s WHERE s.submission_type IN ('TASK', 'PAYMENT') ORDER BY created_at DESC");
   res.render('admin', { users: rows.map(mapUser), key: req.query.key });
+}));
+
+app.get('/admin/vcf', admin, wrap(async (req, res) => {
+  const { rows } = await pool.query("SELECT s.*, (SELECT COUNT(*)::int FROM proofs p WHERE p.submission_id = s.id) AS proof_count FROM submissions s WHERE s.submission_type = 'BUY_VCF' ORDER BY created_at DESC");
+  res.render('admin-vcf', { users: rows.map(mapUser), key: req.query.key });
 }));
 
 app.get('/admin/settings', admin, wrap(async (req, res) => {
@@ -190,10 +225,10 @@ app.post('/admin/reject/:code', admin, wrap(async (req, res) => {
 }));
 
 app.get('/download/vcf', admin, wrap(async (req, res) => {
-  const { rows } = await pool.query("SELECT * FROM submissions WHERE status = 'APPROVED' ORDER BY created_at ASC");
+  const { rows } = await pool.query("SELECT * FROM submissions WHERE status = 'APPROVED' AND submission_type IN ('TASK', 'PAYMENT') ORDER BY created_at ASC");
   if (!rows.length) return res.status(404).render('message', { title: 'No approved contacts yet', message: 'Approved contacts will appear here.', link: '/admin?key=' + encodeURIComponent(req.query.key) });
   const vcf = rows.map((row) => `BEGIN:VCARD\r\nVERSION:3.0\r\nFN:${escapeVcf(row.vcf_formatted_name)}\r\nTEL;TYPE=CELL:${escapeVcf(row.phone_number)}\r\nNOTE:${escapeVcf(row.unique_code)}\r\nEND:VCARD`).join('\r\n') + '\r\n';
-  res.setHeader('Content-Disposition', 'attachment; filename="alotedigitals-contacts.vcf"');
+  res.setHeader('Content-Disposition', 'attachment; filename="alite-digitals-contacts.vcf"');
   res.type('text/vcard; charset=utf-8').send(vcf);
 }));
 
@@ -201,7 +236,7 @@ app.use((err, req, res, next) => res.status(400).render('message', { title: 'Cou
 
 if (!process.env.VERCEL) {
   dbReady.then(() => {
-    app.listen(port, () => console.log(`Alotedigitals platform running at http://localhost:${port}`));
+    app.listen(port, () => console.log(`Alite Digitals platform running at http://localhost:${port}`));
   }).catch((err) => {
     console.error('Failed to initialize database:', err.message);
     process.exit(1);
